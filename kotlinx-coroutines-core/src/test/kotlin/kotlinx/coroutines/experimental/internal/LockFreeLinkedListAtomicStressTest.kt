@@ -21,6 +21,8 @@ import org.junit.Assert.*
 import org.junit.Test
 import java.util.*
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 
 /**
@@ -41,17 +43,21 @@ class LockFreeLinkedListAtomicStressTest : TestBase() {
 
     val lists = Array(nLists) { LockFreeLinkedListHead() }
 
-    val undone = AtomicInteger()
-    val missed = AtomicInteger()
-    val removed = AtomicInteger()
+    val undone = AtomicLong()
+    val missed = AtomicLong()
+    val removed = AtomicLong()
+    val error = AtomicReference<Throwable>()
+
+    @Volatile
+    var stop = false
 
     @Test
     fun testStress() {
-        val deadline = System.currentTimeMillis() + TEST_DURATION
+        println("--- LockFreeLinkedListAtomicStressTest")
         repeat(nAdderThreads) { threadId ->
             threads += thread(start = false, name = "adder-$threadId") {
                 val rnd = Random()
-                while (System.currentTimeMillis() < deadline) {
+                while (!stop) {
                     when (rnd.nextInt(4)) {
                         0 -> {
                             val list = lists[rnd.nextInt(nLists)]
@@ -87,7 +93,9 @@ class LockFreeLinkedListAtomicStressTest : TestBase() {
                             val add1 = list1.describeAddLast(node1)
                             val add2 = list2.describeAddLast(node2)
                             val op = object : AtomicOp<Any?>() {
-                                override fun prepare(affected: Any?): Any? = add1.prepare(this) ?: add2.prepare(this)
+                                override fun prepare(affected: Any?): Any? =
+                                    add1.prepare(this) ?:
+                                    add2.prepare(this)
                                 override fun complete(affected: Any?, failure: Any?) {
                                     add1.complete(this, failure)
                                     add2.complete(this, failure)
@@ -107,7 +115,7 @@ class LockFreeLinkedListAtomicStressTest : TestBase() {
         repeat(nRemoverThreads) { threadId ->
             threads += thread(start = false, name = "remover-$threadId") {
                 val rnd = Random()
-                while (System.currentTimeMillis() < deadline) {
+                while (!stop) {
                     val idx1 = rnd.nextInt(nLists - 1)
                     val idx2 = idx1 + 1 + rnd.nextInt(nLists - idx1 - 1)
                     check(idx1 < idx2) // that is our global order
@@ -116,7 +124,9 @@ class LockFreeLinkedListAtomicStressTest : TestBase() {
                     val remove1 = list1.describeRemoveFirst()
                     val remove2 = list2.describeRemoveFirst()
                     val op = object : AtomicOp<Any?>() {
-                        override fun prepare(affected: Any?): Any? = remove1.prepare(this) ?: remove2.prepare(this)
+                        override fun prepare(affected: Any?): Any? =
+                            remove1.prepare(this) ?:
+                            remove2.prepare(this)
                         override fun complete(affected: Any?, failure: Any?) {
                             remove1.complete(this, failure)
                             remove2.complete(this, failure)
@@ -129,13 +139,39 @@ class LockFreeLinkedListAtomicStressTest : TestBase() {
                 completedRemover.incrementAndGet()
             }
         }
+        threads.forEach { it.setUncaughtExceptionHandler { t, e ->
+            println("Exception in thread $t")
+            e.printStackTrace(System.out)
+            error.compareAndSet(null, e)
+        }}
+        val startTime = System.currentTimeMillis()
+        val deadline = startTime + TEST_DURATION
         threads.forEach(Thread::start)
+        var nextPrintTime = startTime
+        var prevProgress = -1L
+        waitLoop@ while (error.get() == null) {
+            val now = System.currentTimeMillis()
+            if (now >= deadline) break
+            while (now >= nextPrintTime) {
+                val progress = progressStats()
+                if (progress == prevProgress) {
+                    println("!!! Stalled")
+                    dumpTraces(threads)
+                    error.compareAndSet(null, Error("Stalled"))
+                    break@waitLoop
+                }
+                prevProgress = progress
+                println("---")
+                nextPrintTime += 1000L
+            }
+            Thread.sleep(nextPrintTime - now)
+        }
+        stop = true
         threads.forEach(Thread::join)
         println("Completed successfully ${completedAdder.get()} adder threads")
         println("Completed successfully ${completedRemover.get()} remover threads")
-        println("  Adders undone ${undone.get()} node additions")
-        println("  Adders missed ${missed.get()} nodes")
-        println("Remover removed ${removed.get()} nodes")
+        progressStats()
+        error.get()?.let { throw it }
         assertEquals(nAdderThreads, completedAdder.get())
         assertEquals(nRemoverThreads, completedRemover.get())
         assertEquals(missed.get(), removed.get())
@@ -144,13 +180,35 @@ class LockFreeLinkedListAtomicStressTest : TestBase() {
         lists.forEach { it.validate() }
     }
 
-    private fun burnTime(rnd: Random) {
-        when (rnd.nextInt(3)) {
-            0 -> {} // nothing -- be quick
-            1 -> Thread.yield() // burn some time
-            2 -> Thread.sleep(1) // burn more time
-            else -> error("Cannot happen")
+    private fun dumpTraces(threads: List<Thread>) {
+        for (thread in threads) {
+            println("=== Thread $thread")
+            val trace = thread.stackTrace
+            for (t in trace) {
+                println("\tat ${t.className}.${t.methodName}(${t.fileName}:${t.lineNumber})")
+            }
         }
+    }
+
+    private fun progressStats(): Long {
+        val _undone = undone.get()
+        val _missed = missed.get()
+        val _removed = removed.get()
+        println("  Adders undone $_undone node additions")
+        println("  Adders missed $_missed nodes")
+        println("Remover removed $_removed nodes")
+        return _undone + _missed + _removed
+    }
+
+    private val sink = IntArray(1024)
+
+    private fun burnTime(rnd: Random) {
+        if (rnd.nextInt(100) < 95) return // be quick, no wait 95% of time
+        do {
+            val x = rnd.nextInt(100)
+            val i = rnd.nextInt(sink.size)
+            repeat(x) { sink[i] += it }
+        } while (x >= 90)
     }
 
     private fun tryRemove(node: IntNode) {

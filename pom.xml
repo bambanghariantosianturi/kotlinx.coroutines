@@ -70,6 +70,10 @@
 
     <repositories>
         <repository>
+            <id>central</id>
+            <url>http://jcenter.bintray.com</url>
+        </repository>
+        <repository>
             <id>bintray-kotlin-eap</id>
             <name>bintray-kotlin-eap</name>
             <url>http://dl.bintray.com/kotlin/kotlin-eap</url>
